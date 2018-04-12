@@ -175,7 +175,7 @@ func (d *Discovery) createTargetGroup(app *eureka.Application) *config.TargetGro
 		Targets: targets,
 		Labels: model.LabelSet{
 			model.JobLabel: appName,
-			"service": strings.ToLower(appName),
+			model.LabelName("service"): model.LabelValue(strings.ToLower(app.Name)),
 		},
 		Source: app.Name,
 	}
