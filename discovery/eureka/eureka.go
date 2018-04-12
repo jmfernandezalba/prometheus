@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"time"
+	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -174,6 +175,7 @@ func (d *Discovery) createTargetGroup(app *eureka.Application) *config.TargetGro
 		Targets: targets,
 		Labels: model.LabelSet{
 			model.JobLabel: appName,
+			"service": strings.ToLower(appName),
 		},
 		Source: app.Name,
 	}
