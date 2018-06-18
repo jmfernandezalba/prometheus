@@ -128,14 +128,6 @@ var (
 	DefaultRemoteReadConfig = RemoteReadConfig{
 		RemoteTimeout: model.Duration(1 * time.Minute),
 	}
-
-	// DefaultEurekaSDConfig is the default Eureka SD configuration.
-	DefaultEurekaSDConfig = EurekaSDConfig{
-		Timeout:         model.Duration(30 * time.Second),
-		RefreshInterval: model.Duration(30 * time.Second),
-		MetricsPath:     "/prometheus",
-		EnabledOnly:     false,
-	}
 )
 
 // Config is the top-level configuration for Prometheus's config files.
