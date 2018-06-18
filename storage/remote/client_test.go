@@ -14,6 +14,7 @@
 package remote
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -23,8 +24,8 @@ import (
 	"testing"
 	"time"
 
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -66,14 +67,14 @@ func TestStoreHTTPErrorHandling(t *testing.T) {
 		}
 
 		c, err := NewClient(0, &ClientConfig{
-			URL:     &config.URL{URL: serverURL},
+			URL:     &config_util.URL{URL: serverURL},
 			Timeout: model.Duration(time.Second),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = c.Store(&prompb.WriteRequest{})
+		err = c.Store(context.Background(), &prompb.WriteRequest{})
 		if !reflect.DeepEqual(err, test.err) {
 			t.Errorf("%d. Unexpected error; want %v, got %v", i, test.err, err)
 		}

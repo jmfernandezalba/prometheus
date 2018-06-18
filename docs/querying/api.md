@@ -47,7 +47,7 @@ Names of query parameters that may be repeated end with `[]`.
 
 `<series_selector>` placeholders refer to Prometheus [time series
 selectors](basics.md#time-series-selectors) like `http_requests_total` or
-`http_requests_total{method=~"^GET|POST$"}` and need to be URL-encoded.
+`http_requests_total{method=~"(GET|POST)"}` and need to be URL-encoded.
 
 `<duration>` placeholders refer to Prometheus duration strings of the form
 `[0-9]+[smhdwy]`. For example, `5m` refers to a duration of 5 minutes.
@@ -315,9 +315,6 @@ String results are returned as result type `string`. The corresponding
 
 ## Targets
 
-> This API is experimental as it is intended to be extended with targets
-> dropped due to relabelling in the future.
-
 The following endpoint returns an overview of the current state of the
 Prometheus target discovery:
 
@@ -325,12 +322,14 @@ Prometheus target discovery:
 GET /api/v1/targets
 ```
 
-Currently only the active targets are part of the response.
+Both the active and dropped targets are part of the response.
+`labels` represents the label set after relabelling has occurred.
+`discoveredLabels` represent the unmodified labels retrieved during service discovery before relabelling has occurred.
 
 ```json
 $ curl http://localhost:9090/api/v1/targets
 {
-  "status": "success",                                                                                                                                [3/11]
+  "status": "success",
   "data": {
     "activeTargets": [
       {
@@ -349,15 +348,104 @@ $ curl http://localhost:9090/api/v1/targets
         "lastScrape": "2017-01-17T15:07:44.723715405+01:00",
         "health": "up"
       }
+    ],
+    "droppedTargets": [
+      {
+        "discoveredLabels": {
+          "__address__": "127.0.0.1:9100",
+          "__metrics_path__": "/metrics",
+          "__scheme__": "http",
+          "job": "node"
+        },
+      }
     ]
   }
 }
 ```
 
-## Alertmanagers
+## Querying target metadata
 
-> This API is experimental as it is intended to be extended with Alertmanagers
-> dropped due to relabelling in the future.
+The following endpoint returns metadata about metrics currently scraped by targets.
+This is **experimental** and might change in the future.
+
+```
+GET /api/v1/targets/metadata
+```
+
+URL query parameters:
+
+- `match_target=<label_selectors>`: Label selectors that match targets by their label sets. All targets are selected if left empty.
+- `metric=<string>`: A metric name to retrieve metadata for. All metric metadata is retrieved if left empty.
+- `limit=<number>`: Maximum number of targets to match.
+
+The `data` section of the query result consists of a list of objects that
+contain metric metadata and the target label set.
+
+The following example returns all metadata entries for the `go_goroutines` metric
+from the first two targets with label `job="prometheus"`.
+
+```json
+curl -G http://localhost:9091/api/v1/targets/metadata \
+    --data-urlencode 'metric=go_goroutines' \
+    --data-urlencode 'match_target={job="prometheus"}' \
+    --data-urlencode 'limit=2'
+{
+  "status": "success",
+  "data": [
+    {
+      "target": {
+        "instance": "127.0.0.1:9090",
+        "job": "prometheus"
+      },
+      "type": "gauge",
+      "help": "Number of goroutines that currently exist."
+    },
+    {
+      "target": {
+        "instance": "127.0.0.1:9091",
+        "job": "prometheus"
+      },
+      "type": "gauge",
+      "help": "Number of goroutines that currently exist."
+    }
+  ]
+}
+```
+
+The following example returns metadata for all metrics for all targets with
+label `instance="127.0.0.1:9090`.
+
+```json
+curl -G http://localhost:9091/api/v1/targets/metadata \
+    --data-urlencode 'match_target={instance="127.0.0.1:9090"}'
+{
+  "status": "success",
+  "data": [
+    // ...
+    {
+      "target": {
+        "instance": "127.0.0.1:9090",
+        "job": "prometheus"
+      },
+      "metric": "prometheus_treecache_zookeeper_failures_total",
+      "type": "counter",
+      "help": "The total number of ZooKeeper failures."
+    },
+    {
+      "target": {
+        "instance": "127.0.0.1:9090",
+        "job": "prometheus"
+      },
+      "metric": "prometheus_tsdb_reloads_total",
+      "type": "counter",
+      "help": "Number of times the database reloaded block data from disk."
+    },
+    // ...
+  ]
+}
+```
+
+## Alertmanagers
 
 The following endpoint returns an overview of the current state of the
 Prometheus alertmanager discovery:
@@ -366,7 +454,7 @@ Prometheus alertmanager discovery:
 GET /api/v1/alertmanagers
 ```
 
-Currently only the active Alertmanagers are part of the response.
+Both the active and dropped Alertmanagers are part of the response.
 
 ```json
 $ curl http://localhost:9090/api/v1/alertmanagers
@@ -377,7 +465,133 @@ $ curl http://localhost:9090/api/v1/alertmanagers
       {
         "url": "http://127.0.0.1:9090/api/v1/alerts"
       }
+    ],
+    "droppedAlertmanagers": [
+      {
+        "url": "http://127.0.0.1:9093/api/v1/alerts"
+      }
     ]
   }
 }
 ```
+
+## Status
+
+Following status endpoints expose current Prometheus configuration.
+
+### Config
+
+The following endpoint returns currently loaded configuration file:
+
+```
+GET /api/v1/status/config
+```
+
+The config is returned as dumped YAML file. Due to limitation of the YAML
+library, YAML comments are not included.
+
+```json
+$ curl http://localhost:9090/api/v1/status/config
+{
+  "status": "success",
+  "data": {
+    "yaml": "<content of the loaded config file in YAML>",
+  }
+}
+```
+
+### Flags
+
+The following endpoint returns flag values that Prometheus was configured with:
+
+```
+GET /api/v1/status/flags
+```
+
+All values are in a form of "string".
+
+```json
+$ curl http://localhost:9090/api/v1/status/flags
+{
+  "status": "success",
+  "data": {
+    "alertmanager.notification-queue-capacity": "10000",
+    "alertmanager.timeout": "10s",
+    "log.level": "info",
+    "query.lookback-delta": "5m",
+    "query.max-concurrency": "20",
+    ...
+  }
+}
+```
+
+*New in v2.2*
+
+## TSDB Admin APIs
+These are APIs that expose database functionalities for the advanced user. These APIs are not enabled unless the `--web.enable-admin-api` is set.
+
+We also expose a gRPC API whose definition can be found [here](https://github.com/prometheus/prometheus/blob/master/prompb/rpc.proto). This is experimental and might change in the future.
+
+### Snapshot
+Snapshot creates a snapshot of all current data into `snapshots/<datetime>-<rand>` under the TSDB's data directory and returns the directory as response.
+It will optionally skip snapshotting data that is only present in the head block, and which has not yet been compacted to disk.
+
+```
+POST /api/v1/admin/tsdb/snapshot?skip_head=<bool>
+```
+
+```json
+$ curl -XPOST http://localhost:9090/api/v1/admin/tsdb/snapshot
+{
+  "status": "success",
+  "data": {
+    "name": "20171210T211224Z-2be650b6d019eb54"
+  }
+}
+```
+
+The snapshot now exists at `<data-dir>/snapshots/20171210T211224Z-2be650b6d019eb54`
+
+*New in v2.1*
+
+### Delete Series
+DeleteSeries deletes data for a selection of series in a time range. The actual data still exists on disk and is cleaned up in future compactions or can be explicitly cleaned up by hitting the Clean Tombstones endpoint.
+
+If successful, a `204` is returned.
+
+```
+POST /api/v1/admin/tsdb/delete_series
+```
+
+URL query parameters:
+
+- `match[]=<series_selector>`: Repeated label matcher argument that selects the series to delete. At least one `match[]` argument must be provided.
+- `start=<rfc3339 | unix_timestamp>`: Start timestamp. Optional and defaults to minimum possible time.
+- `end=<rfc3339 | unix_timestamp>`: End timestamp. Optional and defaults to maximum possible time.
+
+Not mentioning both start and end times would clear all the data for the matched series in the database.
+
+Example:
+
+```json
+$ curl -X POST \
+  -g 'http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]=up&match[]=process_start_time_seconds{job="prometheus"}'
+```
+*New in v2.1*
+
+### Clean Tombstones
+CleanTombstones removes the deleted data from disk and cleans up the existing tombstones. This can be used after deleting series to free up space.
+
+If successful, a `204` is returned.
+
+```
+POST /api/v1/admin/tsdb/clean_tombstones
+```
+
+This takes no parameters or body.
+
+```json
+$ curl -XPOST http://localhost:9090/api/v1/admin/tsdb/clean_tombstones
+```
+
+*New in v2.1*

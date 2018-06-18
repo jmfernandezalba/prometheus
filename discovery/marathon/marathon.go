@@ -27,11 +27,10 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/mwitkow/go-conntrack"
 	"github.com/prometheus/client_golang/prometheus"
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/util/httputil"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 )
 
@@ -73,7 +72,47 @@ var (
 			Name:      "sd_marathon_refresh_duration_seconds",
 			Help:      "The duration of a Marathon-SD refresh in seconds.",
 		})
+	// DefaultSDConfig is the default Marathon SD configuration.
+	DefaultSDConfig = SDConfig{
+		RefreshInterval: model.Duration(30 * time.Second),
+	}
 )
+
+// SDConfig is the configuration for services running on Marathon.
+type SDConfig struct {
+	Servers          []string                     `yaml:"servers,omitempty"`
+	RefreshInterval  model.Duration               `yaml:"refresh_interval,omitempty"`
+	AuthToken        config_util.Secret           `yaml:"auth_token,omitempty"`
+	AuthTokenFile    string                       `yaml:"auth_token_file,omitempty"`
+	HTTPClientConfig config_util.HTTPClientConfig `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultSDConfig
+	type plain SDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if len(c.Servers) == 0 {
+		return fmt.Errorf("marathon_sd: must contain at least one Marathon server")
+	}
+	if len(c.AuthToken) > 0 && len(c.AuthTokenFile) > 0 {
+		return fmt.Errorf("marathon_sd: at most one of auth_token & auth_token_file must be configured")
+	}
+	if c.HTTPClientConfig.BasicAuth != nil && (len(c.AuthToken) > 0 || len(c.AuthTokenFile) > 0) {
+		return fmt.Errorf("marathon_sd: at most one of basic_auth, auth_token & auth_token_file must be configured")
+	}
+	if (len(c.HTTPClientConfig.BearerToken) > 0 || len(c.HTTPClientConfig.BearerTokenFile) > 0) && (len(c.AuthToken) > 0 || len(c.AuthTokenFile) > 0) {
+		return fmt.Errorf("marathon_sd: at most one of bearer_token, bearer_token_file, auth_token & auth_token_file must be configured")
+	}
+	if err := c.HTTPClientConfig.Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
 
 func init() {
 	prometheus.MustRegister(refreshFailuresCount)
@@ -87,55 +126,90 @@ type Discovery struct {
 	client          *http.Client
 	servers         []string
 	refreshInterval time.Duration
-	lastRefresh     map[string]*config.TargetGroup
+	lastRefresh     map[string]*targetgroup.Group
 	appsClient      AppListClient
-	token           string
 	logger          log.Logger
 }
 
 // NewDiscovery returns a new Marathon Discovery.
-func NewDiscovery(conf *config.MarathonSDConfig, logger log.Logger) (*Discovery, error) {
+func NewDiscovery(conf SDConfig, logger log.Logger) (*Discovery, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 
-	tls, err := httputil.NewTLSConfig(conf.TLSConfig)
+	rt, err := config_util.NewRoundTripperFromConfig(conf.HTTPClientConfig, "marathon_sd")
 	if err != nil {
 		return nil, err
 	}
 
-	token := string(conf.BearerToken)
-	if conf.BearerTokenFile != "" {
-		bf, err := ioutil.ReadFile(conf.BearerTokenFile)
-		if err != nil {
-			return nil, err
-		}
-		token = strings.TrimSpace(string(bf))
+	if len(conf.AuthToken) > 0 {
+		rt, err = newAuthTokenRoundTripper(conf.AuthToken, rt)
+	} else if len(conf.AuthTokenFile) > 0 {
+		rt, err = newAuthTokenFileRoundTripper(conf.AuthTokenFile, rt)
 	}
-
-	client := &http.Client{
-		Timeout: time.Duration(conf.Timeout),
-		Transport: &http.Transport{
-			TLSClientConfig: tls,
-			DialContext: conntrack.NewDialContextFunc(
-				conntrack.DialWithTracing(),
-				conntrack.DialWithName("marathon_sd"),
-			),
-		},
+	if err != nil {
+		return nil, err
 	}
 
 	return &Discovery{
-		client:          client,
+		client:          &http.Client{Transport: rt},
 		servers:         conf.Servers,
 		refreshInterval: time.Duration(conf.RefreshInterval),
 		appsClient:      fetchApps,
-		token:           token,
 		logger:          logger,
 	}, nil
 }
 
-// Run implements the TargetProvider interface.
-func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
+type authTokenRoundTripper struct {
+	authToken config_util.Secret
+	rt        http.RoundTripper
+}
+
+// newAuthTokenRoundTripper adds the provided auth token to a request.
+func newAuthTokenRoundTripper(token config_util.Secret, rt http.RoundTripper) (http.RoundTripper, error) {
+	return &authTokenRoundTripper{token, rt}, nil
+}
+
+func (rt *authTokenRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	// According to https://docs.mesosphere.com/1.11/security/oss/managing-authentication/
+	// DC/OS wants with "token=" a different Authorization header than implemented in httputil/client.go
+	// so we set this explicitly here.
+	request.Header.Set("Authorization", "token="+string(rt.authToken))
+
+	return rt.rt.RoundTrip(request)
+}
+
+type authTokenFileRoundTripper struct {
+	authTokenFile string
+	rt            http.RoundTripper
+}
+
+// newAuthTokenFileRoundTripper adds the auth token read from the file to a request.
+func newAuthTokenFileRoundTripper(tokenFile string, rt http.RoundTripper) (http.RoundTripper, error) {
+	// fail-fast if we can't read the file.
+	_, err := ioutil.ReadFile(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read auth token file %s: %s", tokenFile, err)
+	}
+	return &authTokenFileRoundTripper{tokenFile, rt}, nil
+}
+
+func (rt *authTokenFileRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	b, err := ioutil.ReadFile(rt.authTokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read auth token file %s: %s", rt.authTokenFile, err)
+	}
+	authToken := strings.TrimSpace(string(b))
+
+	// According to https://docs.mesosphere.com/1.11/security/oss/managing-authentication/
+	// DC/OS wants with "token=" a different Authorization header than implemented in httputil/client.go
+	// so we set this explicitly here.
+	request.Header.Set("Authorization", "token="+authToken)
+	return rt.rt.RoundTrip(request)
+}
+
+// Run implements the Discoverer interface.
+func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -149,7 +223,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 	}
 }
 
-func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*config.TargetGroup) (err error) {
+func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*targetgroup.Group) (err error) {
 	t0 := time.Now()
 	defer func() {
 		refreshDuration.Observe(time.Since(t0).Seconds())
@@ -163,7 +237,7 @@ func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*config.Targ
 		return err
 	}
 
-	all := make([]*config.TargetGroup, 0, len(targetMap))
+	all := make([]*targetgroup.Group, 0, len(targetMap))
 	for _, tg := range targetMap {
 		all = append(all, tg)
 	}
@@ -181,7 +255,7 @@ func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*config.Targ
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case ch <- []*config.TargetGroup{{Source: source}}:
+			case ch <- []*targetgroup.Group{{Source: source}}:
 				level.Debug(d.logger).Log("msg", "Removing group", "source", source)
 			}
 		}
@@ -191,9 +265,9 @@ func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*config.Targ
 	return nil
 }
 
-func (d *Discovery) fetchTargetGroups() (map[string]*config.TargetGroup, error) {
+func (d *Discovery) fetchTargetGroups() (map[string]*targetgroup.Group, error) {
 	url := RandomAppsURL(d.servers)
-	apps, err := d.appsClient(d.client, url, d.token)
+	apps, err := d.appsClient(d.client, url)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +296,8 @@ type DockerContainer struct {
 
 // Container describes the runtime an app in running in.
 type Container struct {
-	Docker DockerContainer `json:"docker"`
+	Docker       DockerContainer `json:"docker"`
+	PortMappings []PortMappings  `json:"portMappings"`
 }
 
 // PortDefinitions describes which load balancer port you should access to access the service.
@@ -246,20 +321,13 @@ type AppList struct {
 }
 
 // AppListClient defines a function that can be used to get an application list from marathon.
-type AppListClient func(client *http.Client, url, token string) (*AppList, error)
+type AppListClient func(client *http.Client, url string) (*AppList, error)
 
 // fetchApps requests a list of applications from a marathon server.
-func fetchApps(client *http.Client, url, token string) (*AppList, error) {
+func fetchApps(client *http.Client, url string) (*AppList, error) {
 	request, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
-	}
-
-	// According to  https://dcos.io/docs/1.8/administration/id-and-access-mgt/managing-authentication
-	// DC/OS wants with "token=" a different Authorization header than implemented in httputil/client.go
-	// so we set this implicitly here
-	if token != "" {
-		request.Header.Set("Authorization", "token="+token)
 	}
 
 	resp, err := client.Do(request)
@@ -267,12 +335,20 @@ func fetchApps(client *http.Client, url, token string) (*AppList, error) {
 		return nil, err
 	}
 
+	if (resp.StatusCode < 200) || (resp.StatusCode >= 300) {
+		return nil, fmt.Errorf("Non 2xx status '%v' response during marathon service discovery", resp.StatusCode)
+	}
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	return parseAppJSON(body)
+	apps, err := parseAppJSON(body)
+	if err != nil {
+		return nil, fmt.Errorf("%v in %s", err, url)
+	}
+	return apps, nil
 }
 
 func parseAppJSON(body []byte) (*AppList, error) {
@@ -293,8 +369,8 @@ func RandomAppsURL(servers []string) string {
 }
 
 // AppsToTargetGroups takes an array of Marathon apps and converts them into target groups.
-func AppsToTargetGroups(apps *AppList) map[string]*config.TargetGroup {
-	tgroups := map[string]*config.TargetGroup{}
+func AppsToTargetGroups(apps *AppList) map[string]*targetgroup.Group {
+	tgroups := map[string]*targetgroup.Group{}
 	for _, a := range apps.Apps {
 		group := createTargetGroup(&a)
 		tgroups[group.Source] = group
@@ -302,13 +378,13 @@ func AppsToTargetGroups(apps *AppList) map[string]*config.TargetGroup {
 	return tgroups
 }
 
-func createTargetGroup(app *App) *config.TargetGroup {
+func createTargetGroup(app *App) *targetgroup.Group {
 	var (
 		targets = targetsForApp(app)
 		appName = model.LabelValue(app.ID)
 		image   = model.LabelValue(app.Container.Docker.Image)
 	)
-	tg := &config.TargetGroup{
+	tg := &targetgroup.Group{
 		Targets: targets,
 		Labels: model.LabelSet{
 			appLabel:   appName,
@@ -344,8 +420,19 @@ func targetsForApp(app *App) []model.LabelSet {
 					target[model.LabelName(ln)] = model.LabelValue(lv)
 				}
 			}
+			// Prior to Marathon 1.5 the port mappings could be found at the path
+			// "container.docker.portMappings".  When support for Marathon 1.4
+			// is dropped then this section of code can be removed.
 			if i < len(app.Container.Docker.PortMappings) {
 				for ln, lv := range app.Container.Docker.PortMappings[i].Labels {
+					ln = portMappingLabelPrefix + strutil.SanitizeLabelName(ln)
+					target[model.LabelName(ln)] = model.LabelValue(lv)
+				}
+			}
+			// In Marathon 1.5.x the container.docker.portMappings object was moved
+			// to container.portMappings.
+			if i < len(app.Container.PortMappings) {
+				for ln, lv := range app.Container.PortMappings[i].Labels {
 					ln = portMappingLabelPrefix + strutil.SanitizeLabelName(ln)
 					target[model.LabelName(ln)] = model.LabelValue(lv)
 				}

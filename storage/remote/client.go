@@ -28,9 +28,8 @@ import (
 	"github.com/prometheus/common/model"
 	"golang.org/x/net/context/ctxhttp"
 
-	"github.com/prometheus/prometheus/config"
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/prometheus/prometheus/util/httputil"
 )
 
 const maxErrMsgLen = 256
@@ -38,21 +37,21 @@ const maxErrMsgLen = 256
 // Client allows reading and writing from/to a remote HTTP endpoint.
 type Client struct {
 	index   int // Used to differentiate clients in metrics.
-	url     *config.URL
+	url     *config_util.URL
 	client  *http.Client
 	timeout time.Duration
 }
 
 // ClientConfig configures a Client.
 type ClientConfig struct {
-	URL              *config.URL
+	URL              *config_util.URL
 	Timeout          model.Duration
-	HTTPClientConfig config.HTTPClientConfig
+	HTTPClientConfig config_util.HTTPClientConfig
 }
 
 // NewClient creates a new Client.
 func NewClient(index int, conf *ClientConfig) (*Client, error) {
-	httpClient, err := httputil.NewClientFromConfig(conf.HTTPClientConfig, "remote_storage")
+	httpClient, err := config_util.NewClientFromConfig(conf.HTTPClientConfig, "remote_storage")
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +69,7 @@ type recoverableError struct {
 }
 
 // Store sends a batch of samples to the HTTP endpoint.
-func (c *Client) Store(req *prompb.WriteRequest) error {
+func (c *Client) Store(ctx context.Context, req *prompb.WriteRequest) error {
 	data, err := proto.Marshal(req)
 	if err != nil {
 		return err
@@ -86,6 +85,7 @@ func (c *Client) Store(req *prompb.WriteRequest) error {
 	httpReq.Header.Add("Content-Encoding", "snappy")
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	httpReq = httpReq.WithContext(ctx)
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()

@@ -83,7 +83,9 @@ type Alert struct {
 	Value float64
 	// The interval during which the condition of this alert held true.
 	// ResolvedAt will be 0 to indicate a still active alert.
-	ActiveAt, ResolvedAt time.Time
+	ActiveAt   time.Time
+	FiredAt    time.Time
+	ResolvedAt time.Time
 }
 
 // An AlertingRule generates alerts from its vector expression.
@@ -99,6 +101,8 @@ type AlertingRule struct {
 	labels labels.Labels
 	// Non-identifying key/value pairs.
 	annotations labels.Labels
+	// Time in seconds taken to evaluate rule.
+	evaluationTime time.Duration
 
 	// Protects the below.
 	mtx sync.Mutex
@@ -149,18 +153,28 @@ func (r *AlertingRule) sample(alert *Alert, ts time.Time) promql.Sample {
 	return s
 }
 
+// SetEvaluationTime updates evaluationTime to the duration it took to evaluate the rule on its last evaluation.
+func (r *AlertingRule) SetEvaluationTime(dur time.Duration) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	r.evaluationTime = dur
+}
+
+// GetEvaluationTime returns the time in seconds it took to evaluate the alerting rule.
+func (r *AlertingRule) GetEvaluationTime() time.Duration {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return r.evaluationTime
+}
+
 // resolvedRetention is the duration for which a resolved alert instance
 // is kept in memory state and consequentally repeatedly sent to the AlertManager.
 const resolvedRetention = 15 * time.Minute
 
 // Eval evaluates the rule expression and then creates pending alerts and fires
 // or removes previously pending alerts accordingly.
-func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, engine *promql.Engine, externalURL *url.URL) (promql.Vector, error) {
-	query, err := engine.NewInstantQuery(r.vector.String(), ts)
-	if err != nil {
-		return nil, err
-	}
-	res, err := query.Exec(ctx).Vector()
+func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, externalURL *url.URL) (promql.Vector, error) {
+	res, err := query(ctx, r.vector.String(), ts)
 	if err != nil {
 		return nil, err
 	}
@@ -193,11 +207,11 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, engine *promql.En
 		expand := func(text string) string {
 			tmpl := template.NewTemplateExpander(
 				ctx,
-				defs+string(text),
+				defs+text,
 				"__alert_"+r.Name(),
 				tmplData,
 				model.Time(timestamp.FromTime(ts)),
-				engine,
+				template.QueryFunc(query),
 				externalURL,
 			)
 			result, err := tmpl.Expand()
@@ -258,6 +272,7 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, engine *promql.En
 
 		if a.State == StatePending && ts.Sub(a.ActiveAt) >= r.holdDuration {
 			a.State = StateFiring
+			a.FiredAt = ts
 		}
 
 		vec = append(vec, r.sample(a, ts))

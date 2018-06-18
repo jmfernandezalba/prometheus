@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/ioutil"
 	stdlog "log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -28,6 +29,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -46,6 +48,8 @@ import (
 	"github.com/opentracing-contrib/go-stdlib/nethttp"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/tsdb"
@@ -55,8 +59,8 @@ import (
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/retrieval"
 	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/template"
 	"github.com/prometheus/prometheus/util/httputil"
@@ -67,17 +71,40 @@ import (
 
 var localhostRepresentations = []string{"127.0.0.1", "localhost"}
 
+var (
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "prometheus_http_request_duration_seconds",
+			Help:    "Histogram of latencies for HTTP requests.",
+			Buckets: []float64{.1, .2, .4, 1, 3, 8, 20, 60, 120},
+		},
+		[]string{"handler"},
+	)
+	responseSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "prometheus_http_response_size_bytes",
+			Help:    "Histogram of response size for HTTP requests.",
+			Buckets: prometheus.ExponentialBuckets(100, 10, 8),
+		},
+		[]string{"handler"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(requestDuration, responseSize)
+}
+
 // Handler serves various HTTP endpoints of the Prometheus server
 type Handler struct {
 	logger log.Logger
 
-	targetManager *retrieval.TargetManager
+	scrapeManager *scrape.Manager
 	ruleManager   *rules.Manager
 	queryEngine   *promql.Engine
 	context       context.Context
 	tsdb          func() *tsdb.DB
 	storage       storage.Storage
-	notifier      *notifier.Notifier
+	notifier      *notifier.Manager
 
 	apiV1 *api_v1.API
 
@@ -125,9 +152,9 @@ type Options struct {
 	TSDB          func() *tsdb.DB
 	Storage       storage.Storage
 	QueryEngine   *promql.Engine
-	TargetManager *retrieval.TargetManager
+	ScrapeManager *scrape.Manager
 	RuleManager   *rules.Manager
-	Notifier      *notifier.Notifier
+	Notifier      *notifier.Manager
 	Version       *PrometheusVersion
 	Flags         map[string]string
 
@@ -136,7 +163,6 @@ type Options struct {
 	MaxConnections       int
 	ExternalURL          *url.URL
 	RoutePrefix          string
-	MetricsPath          string
 	UseLocalAssets       bool
 	UserAssetsPath       string
 	ConsoleTemplatesPath string
@@ -145,9 +171,19 @@ type Options struct {
 	EnableAdminAPI       bool
 }
 
+func instrumentHandler(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
+	return promhttp.InstrumentHandlerDuration(
+		requestDuration.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+		promhttp.InstrumentHandlerResponseSize(
+			responseSize.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+			handler,
+		),
+	)
+}
+
 // New initializes a new web Handler.
 func New(logger log.Logger, o *Options) *Handler {
-	router := route.New()
+	router := route.New().WithInstrumentation(instrumentHandler)
 	cwd, err := os.Getwd()
 
 	if err != nil {
@@ -169,7 +205,7 @@ func New(logger log.Logger, o *Options) *Handler {
 		flagsMap:    o.Flags,
 
 		context:       o.Context,
-		targetManager: o.TargetManager,
+		scrapeManager: o.ScrapeManager,
 		ruleManager:   o.RuleManager,
 		queryEngine:   o.QueryEngine,
 		tsdb:          o.TSDB,
@@ -181,13 +217,16 @@ func New(logger log.Logger, o *Options) *Handler {
 		ready: 0,
 	}
 
-	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, h.targetManager, h.notifier,
+	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, h.scrapeManager, h.notifier,
 		func() config.Config {
 			h.mtx.RLock()
 			defer h.mtx.RUnlock()
 			return *h.config
 		},
+		o.Flags,
 		h.testReady,
+		h.options.TSDB,
+		h.options.EnableAdminAPI,
 	)
 
 	if o.RoutePrefix != "/" {
@@ -198,37 +237,36 @@ func New(logger log.Logger, o *Options) *Handler {
 		router = router.WithPrefix(o.RoutePrefix)
 	}
 
-	instrh := prometheus.InstrumentHandler
-	instrf := prometheus.InstrumentHandlerFunc
 	readyf := h.testReady
 
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, path.Join(o.ExternalURL.Path, "/graph"), http.StatusFound)
 	})
 
-	router.Get("/alerts", readyf(instrf("alerts", h.alerts)))
-	router.Get("/graph", readyf(instrf("graph", h.graph)))
-	router.Get("/status", readyf(instrf("status", h.status)))
-	router.Get("/flags", readyf(instrf("flags", h.flags)))
-	router.Get("/config", readyf(instrf("config", h.serveConfig)))
-	router.Get("/rules", readyf(instrf("rules", h.rules)))
-	router.Get("/targets", readyf(instrf("targets", h.targets)))
-	router.Get("/version", readyf(instrf("version", h.version)))
+	router.Get("/alerts", readyf(h.alerts))
+	router.Get("/graph", readyf(h.graph))
+	router.Get("/status", readyf(h.status))
+	router.Get("/flags", readyf(h.flags))
+	router.Get("/config", readyf(h.serveConfig))
+	router.Get("/rules", readyf(h.rules))
+	router.Get("/targets", readyf(h.targets))
+	router.Get("/version", readyf(h.version))
+	router.Get("/service-discovery", readyf(h.serviceDiscovery))
 
-	router.Get("/heap", instrf("heap", h.dumpHeap))
+	router.Get("/heap", h.dumpHeap)
 
-	router.Get("/metrics", prometheus.Handler().ServeHTTP)
+	router.Get("/metrics", promhttp.Handler().ServeHTTP)
 
-	router.Get("/federate", readyf(instrh("federate", httputil.CompressionHandler{
+	router.Get("/federate", readyf(httputil.CompressionHandler{
 		Handler: http.HandlerFunc(h.federation),
-	})))
+	}.ServeHTTP))
 
-	router.Get("/consoles/*filepath", readyf(instrf("consoles", h.consoles)))
+	router.Get("/consoles/*filepath", readyf(h.consoles))
 
-	router.Get("/static/*filepath", instrf("static", h.serveStaticAsset))
+	router.Get("/static/*filepath", h.serveStaticAsset)
 
 	if o.UserAssetsPath != "" {
-		router.Get("/user/*filepath", instrf("user", route.FileServe(o.UserAssetsPath)))
+		router.Get("/user/*filepath", route.FileServe(o.UserAssetsPath))
 	}
 
 	if o.EnableLifecycle {
@@ -342,10 +380,7 @@ func (h *Handler) Ready() {
 // Verifies whether the server is ready or not.
 func (h *Handler) isReady() bool {
 	ready := atomic.LoadUint32(&h.ready)
-	if ready == 0 {
-		return false
-	}
-	return true
+	return ready > 0
 }
 
 // Checks if server is ready, calls f if it is, returns 503 if it is not.
@@ -401,8 +436,8 @@ func (h *Handler) Run(ctx context.Context) error {
 		h.options.TSDB,
 		h.options.QueryEngine,
 		h.options.Storage.Querier,
-		func() []*retrieval.Target {
-			return h.options.TargetManager.Targets()
+		func() []*scrape.Target {
+			return h.options.ScrapeManager.TargetsActive()
 		},
 		func() []*url.URL {
 			return h.options.Notifier.Alertmanagers()
@@ -411,7 +446,7 @@ func (h *Handler) Run(ctx context.Context) error {
 	)
 	av2.RegisterGRPC(grpcSrv)
 
-	hh, err := av2.HTTPHandler(grpcl.Addr().String())
+	hh, err := av2.HTTPHandler(h.options.ListenAddress)
 	if err != nil {
 		return err
 	}
@@ -424,7 +459,7 @@ func (h *Handler) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/", h.router)
 
-	av1 := route.New()
+	av1 := route.New().WithInstrumentation(instrumentHandler)
 	h.apiV1.Register(av1)
 	apiPath := "/api"
 	if h.options.RoutePrefix != "/" {
@@ -449,18 +484,13 @@ func (h *Handler) Run(ctx context.Context) error {
 		ReadTimeout: h.options.ReadTimeout,
 	}
 
-	go func() {
-		if err := httpSrv.Serve(httpl); err != nil {
-			level.Warn(h.logger).Log("msg", "error serving HTTP", "err", err)
-		}
-	}()
-	go func() {
-		if err := grpcSrv.Serve(grpcl); err != nil {
-			level.Warn(h.logger).Log("msg", "error serving gRPC", "err", err)
-		}
-	}()
-
 	errCh := make(chan error)
+	go func() {
+		errCh <- httpSrv.Serve(httpl)
+	}()
+	go func() {
+		errCh <- grpcSrv.Serve(grpcl)
+	}()
 	go func() {
 		errCh <- m.Serve()
 	}()
@@ -527,7 +557,15 @@ func (h *Handler) consoles(w http.ResponseWriter, r *http.Request) {
 		Path:      strings.TrimLeft(name, "/"),
 	}
 
-	tmpl := template.NewTemplateExpander(h.context, string(text), "__console_"+name, data, h.now(), h.queryEngine, h.options.ExternalURL)
+	tmpl := template.NewTemplateExpander(
+		h.context,
+		string(text),
+		"__console_"+name,
+		data,
+		h.now(),
+		template.QueryFunc(rules.EngineQueryFunc(h.queryEngine, h.storage)),
+		h.options.ExternalURL,
+	)
 	filenames, err := filepath.Glob(h.options.ConsoleLibrariesPath + "/*.lib")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -546,17 +584,62 @@ func (h *Handler) graph(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	h.executeTemplate(w, "status.html", struct {
-		Birth         time.Time
-		CWD           string
-		Version       *PrometheusVersion
-		Alertmanagers []*url.URL
+	status := struct {
+		Birth               time.Time
+		CWD                 string
+		Version             *PrometheusVersion
+		Alertmanagers       []*url.URL
+		GoroutineCount      int
+		GOMAXPROCS          int
+		GOGC                string
+		CorruptionCount     int64
+		ChunkCount          int64
+		TimeSeriesCount     int64
+		LastConfigTime      time.Time
+		ReloadConfigSuccess bool
 	}{
-		Birth:         h.birth,
-		CWD:           h.cwd,
-		Version:       h.versionInfo,
-		Alertmanagers: h.notifier.Alertmanagers(),
-	})
+		Birth:          h.birth,
+		CWD:            h.cwd,
+		Version:        h.versionInfo,
+		Alertmanagers:  h.notifier.Alertmanagers(),
+		GoroutineCount: runtime.NumGoroutine(),
+		GOMAXPROCS:     runtime.GOMAXPROCS(0),
+		GOGC:           os.Getenv("GOGC"),
+	}
+	metrics, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error gathering runtime status: %s", err), http.StatusInternalServerError)
+		return
+	}
+	for _, mF := range metrics {
+		switch *mF.Name {
+		case "prometheus_tsdb_head_chunks":
+			status.ChunkCount = int64(toFloat64(mF))
+		case "prometheus_tsdb_head_series":
+			status.TimeSeriesCount = int64(toFloat64(mF))
+		case "prometheus_tsdb_wal_corruptions_total":
+			status.CorruptionCount = int64(toFloat64(mF))
+		case "prometheus_config_last_reload_successful":
+			status.ReloadConfigSuccess = toFloat64(mF) != 0
+		case "prometheus_config_last_reload_success_timestamp_seconds":
+			status.LastConfigTime = time.Unix(int64(toFloat64(mF)), 0)
+		}
+	}
+	h.executeTemplate(w, "status.html", status)
+}
+
+func toFloat64(f *io_prometheus_client.MetricFamily) float64 {
+	m := *f.Metric[0]
+	if m.Gauge != nil {
+		return m.Gauge.GetValue()
+	}
+	if m.Counter != nil {
+		return m.Counter.GetValue()
+	}
+	if m.Untyped != nil {
+		return m.Untyped.GetValue()
+	}
+	return math.NaN()
 }
 
 func (h *Handler) flags(w http.ResponseWriter, r *http.Request) {
@@ -574,10 +657,51 @@ func (h *Handler) rules(w http.ResponseWriter, r *http.Request) {
 	h.executeTemplate(w, "rules.html", h.ruleManager)
 }
 
+func (h *Handler) serviceDiscovery(w http.ResponseWriter, r *http.Request) {
+	var index []string
+	targets := h.scrapeManager.TargetsAll()
+	for job := range targets {
+		index = append(index, job)
+	}
+	sort.Strings(index)
+	scrapeConfigData := struct {
+		Index   []string
+		Targets map[string][]*scrape.Target
+		Active  []int
+		Dropped []int
+		Total   []int
+	}{
+		Index:   index,
+		Targets: make(map[string][]*scrape.Target),
+		Active:  make([]int, len(index)),
+		Dropped: make([]int, len(index)),
+		Total:   make([]int, len(index)),
+	}
+	for i, job := range scrapeConfigData.Index {
+		scrapeConfigData.Targets[job] = make([]*scrape.Target, 0, len(targets[job]))
+		scrapeConfigData.Total[i] = len(targets[job])
+		for _, target := range targets[job] {
+			// Do not display more than 100 dropped targets per job to avoid
+			// returning too much data to the clients.
+			if target.Labels().Len() == 0 {
+				scrapeConfigData.Dropped[i]++
+				if scrapeConfigData.Dropped[i] > 100 {
+					continue
+				}
+			} else {
+				scrapeConfigData.Active[i]++
+			}
+			scrapeConfigData.Targets[job] = append(scrapeConfigData.Targets[job], target)
+		}
+	}
+
+	h.executeTemplate(w, "service-discovery.html", scrapeConfigData)
+}
+
 func (h *Handler) targets(w http.ResponseWriter, r *http.Request) {
 	// Bucket targets by job label
-	tps := map[string][]*retrieval.Target{}
-	for _, t := range h.targetManager.Targets() {
+	tps := map[string][]*scrape.Target{}
+	for _, t := range h.scrapeManager.TargetsActive() {
 		job := t.Labels().Get(model.JobLabel)
 		tps[job] = append(tps[job], t)
 	}
@@ -589,7 +713,7 @@ func (h *Handler) targets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.executeTemplate(w, "targets.html", struct {
-		TargetPools map[string][]*retrieval.Target
+		TargetPools map[string][]*scrape.Target
 	}{
 		TargetPools: tps,
 	})
@@ -679,21 +803,21 @@ func tmplFuncs(consolesPath string, opts *Options) template_text.FuncMap {
 			}
 			return u
 		},
-		"numHealthy": func(pool []*retrieval.Target) int {
+		"numHealthy": func(pool []*scrape.Target) int {
 			alive := len(pool)
 			for _, p := range pool {
-				if p.Health() != retrieval.HealthGood {
+				if p.Health() != scrape.HealthGood {
 					alive--
 				}
 			}
 
 			return alive
 		},
-		"healthToClass": func(th retrieval.TargetHealth) string {
+		"healthToClass": func(th scrape.TargetHealth) string {
 			switch th {
-			case retrieval.HealthUnknown:
+			case scrape.HealthUnknown:
 				return "warning"
-			case retrieval.HealthGood:
+			case scrape.HealthGood:
 				return "success"
 			default:
 				return "danger"
@@ -732,7 +856,15 @@ func (h *Handler) executeTemplate(w http.ResponseWriter, name string, data inter
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	tmpl := template.NewTemplateExpander(h.context, text, name, data, h.now(), h.queryEngine, h.options.ExternalURL)
+	tmpl := template.NewTemplateExpander(
+		h.context,
+		text,
+		name,
+		data,
+		h.now(),
+		template.QueryFunc(rules.EngineQueryFunc(h.queryEngine, h.storage)),
+		h.options.ExternalURL,
+	)
 	tmpl.Funcs(tmplFuncs(h.consolesPath(), h.options))
 
 	result, err := tmpl.ExpandHTML(nil)

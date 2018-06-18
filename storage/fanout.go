@@ -216,12 +216,16 @@ func NewMergeQuerier(queriers []Querier) Querier {
 }
 
 // Select returns a set of series that matches the given label matchers.
-func (q *mergeQuerier) Select(matchers ...*labels.Matcher) SeriesSet {
+func (q *mergeQuerier) Select(params *SelectParams, matchers ...*labels.Matcher) (SeriesSet, error) {
 	seriesSets := make([]SeriesSet, 0, len(q.queriers))
 	for _, querier := range q.queriers {
-		seriesSets = append(seriesSets, querier.Select(matchers...))
+		set, err := querier.Select(params, matchers...)
+		if err != nil {
+			return nil, err
+		}
+		seriesSets = append(seriesSets, set)
 	}
-	return newMergeSeriesSet(seriesSets)
+	return NewMergeSeriesSet(seriesSets), nil
 }
 
 // LabelValues returns all potential values for a label name.
@@ -296,7 +300,13 @@ type mergeSeriesSet struct {
 	sets          []SeriesSet
 }
 
-func newMergeSeriesSet(sets []SeriesSet) SeriesSet {
+// NewMergeSeriesSet returns a new series set that merges (deduplicates)
+// series returned by the input series sets when iterating.
+func NewMergeSeriesSet(sets []SeriesSet) SeriesSet {
+	if len(sets) == 1 {
+		return sets[0]
+	}
+
 	// Sets need to be pre-advanced, so we can introspect the label of the
 	// series under the cursor.
 	var h seriesSetHeap
@@ -334,6 +344,9 @@ func (c *mergeSeriesSet) Next() bool {
 }
 
 func (c *mergeSeriesSet) At() Series {
+	if len(c.currentSets) == 1 {
+		return c.currentSets[0].At()
+	}
 	series := []Series{}
 	for _, seriesSet := range c.currentSets {
 		series = append(series, seriesSet.At())
@@ -419,7 +432,6 @@ func (c *mergeIterator) At() (t int64, v float64) {
 		panic("mergeIterator.At() called after .Next() returned false.")
 	}
 
-	// TODO do I need to dedupe or just merge?
 	return c.h[0].At()
 }
 
@@ -430,6 +442,7 @@ func (c *mergeIterator) Next() bool {
 				heap.Push(&c.h, iter)
 			}
 		}
+
 		return len(c.h) > 0
 	}
 
@@ -437,9 +450,17 @@ func (c *mergeIterator) Next() bool {
 		return false
 	}
 
-	iter := heap.Pop(&c.h).(SeriesIterator)
-	if iter.Next() {
-		heap.Push(&c.h, iter)
+	currt, currv := c.At()
+	for len(c.h) > 0 {
+		nextt, nextv := c.h[0].At()
+		if nextt != currt || nextv != currv {
+			break
+		}
+
+		iter := heap.Pop(&c.h).(SeriesIterator)
+		if iter.Next() {
+			heap.Push(&c.h, iter)
+		}
 	}
 
 	return len(c.h) > 0

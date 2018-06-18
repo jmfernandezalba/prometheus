@@ -16,6 +16,7 @@ package remote
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/common/model"
@@ -39,14 +40,19 @@ type Storage struct {
 	// For reads
 	queryables             []storage.Queryable
 	localStartTimeCallback startTimeCallback
+	flushDeadline          time.Duration
 }
 
 // NewStorage returns a remote.Storage.
-func NewStorage(l log.Logger, stCallback startTimeCallback) *Storage {
+func NewStorage(l log.Logger, stCallback startTimeCallback, flushDeadline time.Duration) *Storage {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
-	return &Storage{logger: l, localStartTimeCallback: stCallback}
+	return &Storage{
+		logger:                 l,
+		localStartTimeCallback: stCallback,
+		flushDeadline:          flushDeadline,
+	}
 }
 
 // ApplyConfig updates the state as the new config requires.
@@ -70,10 +76,11 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 		}
 		newQueues = append(newQueues, NewQueueManager(
 			s.logger,
-			config.DefaultQueueConfig,
+			rwConf.QueueConfig,
 			conf.GlobalConfig.ExternalLabels,
 			rwConf.WriteRelabelConfigs,
 			c,
+			s.flushDeadline,
 		))
 	}
 
@@ -99,8 +106,7 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 			return err
 		}
 
-		var q storage.Queryable
-		q = QueryableClient(c)
+		q := QueryableClient(c)
 		q = ExternablLabelsHandler(q, conf.GlobalConfig.ExternalLabels)
 		if len(rrConf.RequiredMatchers) > 0 {
 			q = RequiredMatchersFilter(q, labelsToEqualityMatchers(rrConf.RequiredMatchers))

@@ -15,6 +15,7 @@ package kubernetes
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"sync"
 	"time"
@@ -22,15 +23,19 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api"
 	apiv1 "k8s.io/client-go/pkg/api/v1"
 	extensionsv1beta1 "k8s.io/client-go/pkg/apis/extensions/v1beta1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-
-	"github.com/prometheus/prometheus/config"
 )
 
 const (
@@ -48,7 +53,83 @@ var (
 		},
 		[]string{"role", "event"},
 	)
+	// DefaultSDConfig is the default Kubernetes SD configuration
+	DefaultSDConfig = SDConfig{}
 )
+
+// Role is role of the service in Kubernetes.
+type Role string
+
+// The valid options for Role.
+const (
+	RoleNode     Role = "node"
+	RolePod      Role = "pod"
+	RoleService  Role = "service"
+	RoleEndpoint Role = "endpoints"
+	RoleIngress  Role = "ingress"
+)
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *Role) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	if err := unmarshal((*string)(c)); err != nil {
+		return err
+	}
+	switch *c {
+	case RoleNode, RolePod, RoleService, RoleEndpoint, RoleIngress:
+		return nil
+	default:
+		return fmt.Errorf("Unknown Kubernetes SD role %q", *c)
+	}
+}
+
+// SDConfig is the configuration for Kubernetes service discovery.
+type SDConfig struct {
+	APIServer          config_util.URL        `yaml:"api_server"`
+	Role               Role                   `yaml:"role"`
+	BasicAuth          *config_util.BasicAuth `yaml:"basic_auth,omitempty"`
+	BearerToken        config_util.Secret     `yaml:"bearer_token,omitempty"`
+	BearerTokenFile    string                 `yaml:"bearer_token_file,omitempty"`
+	TLSConfig          config_util.TLSConfig  `yaml:"tls_config,omitempty"`
+	NamespaceDiscovery NamespaceDiscovery     `yaml:"namespaces"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = SDConfig{}
+	type plain SDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if c.Role == "" {
+		return fmt.Errorf("role missing (one of: pod, service, endpoints, node)")
+	}
+	if len(c.BearerToken) > 0 && len(c.BearerTokenFile) > 0 {
+		return fmt.Errorf("at most one of bearer_token & bearer_token_file must be configured")
+	}
+	if c.BasicAuth != nil && (len(c.BearerToken) > 0 || len(c.BearerTokenFile) > 0) {
+		return fmt.Errorf("at most one of basic_auth, bearer_token & bearer_token_file must be configured")
+	}
+	if c.APIServer.URL == nil &&
+		(c.BasicAuth != nil || c.BearerToken != "" || c.BearerTokenFile != "" ||
+			c.TLSConfig.CAFile != "" || c.TLSConfig.CertFile != "" || c.TLSConfig.KeyFile != "") {
+		return fmt.Errorf("to use custom authentication please provide the 'api_server' URL explicitly")
+	}
+	return nil
+}
+
+// NamespaceDiscovery is the configuration for discovering
+// Kubernetes namespaces.
+type NamespaceDiscovery struct {
+	Names []string `yaml:"names"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *NamespaceDiscovery) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = NamespaceDiscovery{}
+	type plain NamespaceDiscovery
+	return unmarshal((*plain)(c))
+}
 
 func init() {
 	prometheus.MustRegister(eventCount)
@@ -61,13 +142,20 @@ func init() {
 	}
 }
 
-// Discovery implements the TargetProvider interface for discovering
+// This is only for internal use.
+type discoverer interface {
+	Run(ctx context.Context, up chan<- []*targetgroup.Group)
+}
+
+// Discovery implements the discoverer interface for discovering
 // targets from Kubernetes.
 type Discovery struct {
+	sync.RWMutex
 	client             kubernetes.Interface
-	role               config.KubernetesRole
+	role               Role
 	logger             log.Logger
-	namespaceDiscovery *config.KubernetesNamespaceDiscovery
+	namespaceDiscovery *NamespaceDiscovery
+	discoverers        []discoverer
 }
 
 func (d *Discovery) getNamespaces() []string {
@@ -79,7 +167,7 @@ func (d *Discovery) getNamespaces() []string {
 }
 
 // New creates a new Kubernetes discovery for the given role.
-func New(l log.Logger, conf *config.KubernetesSDConfig) (*Discovery, error) {
+func New(l log.Logger, conf *SDConfig) (*Discovery, error) {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
@@ -148,132 +236,155 @@ func New(l log.Logger, conf *config.KubernetesSDConfig) (*Discovery, error) {
 		logger:             l,
 		role:               conf.Role,
 		namespaceDiscovery: &conf.NamespaceDiscovery,
+		discoverers:        make([]discoverer, 0),
 	}, nil
 }
 
 const resyncPeriod = 10 * time.Minute
 
-// Run implements the TargetProvider interface.
-func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
-	rclient := d.client.Core().RESTClient()
-	reclient := d.client.Extensions().RESTClient()
-
+// Run implements the discoverer interface.
+func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	d.Lock()
 	namespaces := d.getNamespaces()
 
 	switch d.role {
-	case "endpoints":
-		var wg sync.WaitGroup
-
+	case RoleEndpoint:
 		for _, namespace := range namespaces {
-			elw := cache.NewListWatchFromClient(rclient, "endpoints", namespace, nil)
-			slw := cache.NewListWatchFromClient(rclient, "services", namespace, nil)
-			plw := cache.NewListWatchFromClient(rclient, "pods", namespace, nil)
+			e := d.client.CoreV1().Endpoints(namespace)
+			elw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return e.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return e.Watch(options)
+				},
+			}
+			s := d.client.CoreV1().Services(namespace)
+			slw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return s.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return s.Watch(options)
+				},
+			}
+			p := d.client.CoreV1().Pods(namespace)
+			plw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return p.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return p.Watch(options)
+				},
+			}
 			eps := NewEndpoints(
 				log.With(d.logger, "role", "endpoint"),
 				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
 				cache.NewSharedInformer(elw, &apiv1.Endpoints{}, resyncPeriod),
 				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
 			)
+			d.discoverers = append(d.discoverers, eps)
 			go eps.endpointsInf.Run(ctx.Done())
 			go eps.serviceInf.Run(ctx.Done())
 			go eps.podInf.Run(ctx.Done())
-
-			for !eps.serviceInf.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			for !eps.endpointsInf.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			for !eps.podInf.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				eps.Run(ctx, ch)
-			}()
 		}
-		wg.Wait()
-	case "pod":
-		var wg sync.WaitGroup
+	case RolePod:
 		for _, namespace := range namespaces {
-			plw := cache.NewListWatchFromClient(rclient, "pods", namespace, nil)
+			p := d.client.CoreV1().Pods(namespace)
+			plw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return p.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return p.Watch(options)
+				},
+			}
 			pod := NewPod(
 				log.With(d.logger, "role", "pod"),
 				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
 			)
+			d.discoverers = append(d.discoverers, pod)
 			go pod.informer.Run(ctx.Done())
-
-			for !pod.informer.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				pod.Run(ctx, ch)
-			}()
 		}
-		wg.Wait()
-	case "service":
-		var wg sync.WaitGroup
+	case RoleService:
 		for _, namespace := range namespaces {
-			slw := cache.NewListWatchFromClient(rclient, "services", namespace, nil)
+			s := d.client.CoreV1().Services(namespace)
+			slw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return s.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return s.Watch(options)
+				},
+			}
 			svc := NewService(
 				log.With(d.logger, "role", "service"),
 				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
 			)
+			d.discoverers = append(d.discoverers, svc)
 			go svc.informer.Run(ctx.Done())
-
-			for !svc.informer.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				svc.Run(ctx, ch)
-			}()
 		}
-		wg.Wait()
-	case "ingress":
-		var wg sync.WaitGroup
+	case RoleIngress:
 		for _, namespace := range namespaces {
-			ilw := cache.NewListWatchFromClient(reclient, "ingresses", namespace, nil)
+			i := d.client.ExtensionsV1beta1().Ingresses(namespace)
+			ilw := &cache.ListWatch{
+				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					return i.List(options)
+				},
+				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+					return i.Watch(options)
+				},
+			}
 			ingress := NewIngress(
 				log.With(d.logger, "role", "ingress"),
 				cache.NewSharedInformer(ilw, &extensionsv1beta1.Ingress{}, resyncPeriod),
 			)
+			d.discoverers = append(d.discoverers, ingress)
 			go ingress.informer.Run(ctx.Done())
-
-			for !ingress.informer.HasSynced() {
-				time.Sleep(100 * time.Millisecond)
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				ingress.Run(ctx, ch)
-			}()
 		}
-		wg.Wait()
-	case "node":
-		nlw := cache.NewListWatchFromClient(rclient, "nodes", api.NamespaceAll, nil)
+	case RoleNode:
+		nlw := &cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				return d.client.CoreV1().Nodes().List(options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				return d.client.CoreV1().Nodes().Watch(options)
+			},
+		}
 		node := NewNode(
 			log.With(d.logger, "role", "node"),
 			cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod),
 		)
+		d.discoverers = append(d.discoverers, node)
 		go node.informer.Run(ctx.Done())
-
-		for !node.informer.HasSynced() {
-			time.Sleep(100 * time.Millisecond)
-		}
-		node.Run(ctx, ch)
-
 	default:
 		level.Error(d.logger).Log("msg", "unknown Kubernetes discovery kind", "role", d.role)
 	}
 
+	var wg sync.WaitGroup
+	for _, dd := range d.discoverers {
+		wg.Add(1)
+		go func(d discoverer) {
+			defer wg.Done()
+			d.Run(ctx, ch)
+		}(dd)
+	}
+
+	d.Unlock()
 	<-ctx.Done()
 }
 
 func lv(s string) model.LabelValue {
 	return model.LabelValue(s)
+}
+
+func send(ctx context.Context, l log.Logger, role Role, ch chan<- []*targetgroup.Group, tg *targetgroup.Group) {
+	if tg == nil {
+		return
+	}
+	level.Debug(l).Log("msg", "kubernetes discovery update", "role", string(role), "tg", fmt.Sprintf("%#v", tg))
+	select {
+	case <-ctx.Done():
+	case ch <- []*targetgroup.Group{tg}:
+	}
 }

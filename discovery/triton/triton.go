@@ -27,8 +27,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
-	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/util/httputil"
+	config_util "github.com/prometheus/common/config"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
 const (
@@ -52,7 +52,47 @@ var (
 			Name: "prometheus_sd_triton_refresh_duration_seconds",
 			Help: "The duration of a Triton-SD refresh in seconds.",
 		})
+	// DefaultSDConfig is the default Triton SD configuration.
+	DefaultSDConfig = SDConfig{
+		Port:            9163,
+		RefreshInterval: model.Duration(60 * time.Second),
+		Version:         1,
+	}
 )
+
+// SDConfig is the configuration for Triton based service discovery.
+type SDConfig struct {
+	Account         string                `yaml:"account"`
+	DNSSuffix       string                `yaml:"dns_suffix"`
+	Endpoint        string                `yaml:"endpoint"`
+	Port            int                   `yaml:"port"`
+	RefreshInterval model.Duration        `yaml:"refresh_interval,omitempty"`
+	TLSConfig       config_util.TLSConfig `yaml:"tls_config,omitempty"`
+	Version         int                   `yaml:"version"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultSDConfig
+	type plain SDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if c.Account == "" {
+		return fmt.Errorf("Triton SD configuration requires an account")
+	}
+	if c.DNSSuffix == "" {
+		return fmt.Errorf("Triton SD configuration requires a dns_suffix")
+	}
+	if c.Endpoint == "" {
+		return fmt.Errorf("Triton SD configuration requires an endpoint")
+	}
+	if c.RefreshInterval <= 0 {
+		return fmt.Errorf("Triton SD configuration requires RefreshInterval to be a positive integer")
+	}
+	return nil
+}
 
 func init() {
 	prometheus.MustRegister(refreshFailuresCount)
@@ -71,21 +111,21 @@ type DiscoveryResponse struct {
 }
 
 // Discovery periodically performs Triton-SD requests. It implements
-// the TargetProvider interface.
+// the Discoverer interface.
 type Discovery struct {
 	client   *http.Client
 	interval time.Duration
 	logger   log.Logger
-	sdConfig *config.TritonSDConfig
+	sdConfig *SDConfig
 }
 
 // New returns a new Discovery which periodically refreshes its targets.
-func New(logger log.Logger, conf *config.TritonSDConfig) (*Discovery, error) {
+func New(logger log.Logger, conf *SDConfig) (*Discovery, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 
-	tls, err := httputil.NewTLSConfig(conf.TLSConfig)
+	tls, err := config_util.NewTLSConfig(&conf.TLSConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -107,8 +147,8 @@ func New(logger log.Logger, conf *config.TritonSDConfig) (*Discovery, error) {
 	}, nil
 }
 
-// Run implements the TargetProvider interface.
-func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
+// Run implements the Discoverer interface.
+func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	defer close(ch)
 
 	ticker := time.NewTicker(d.interval)
@@ -119,7 +159,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 	if err != nil {
 		level.Error(d.logger).Log("msg", "Refreshing targets failed", "err", err)
 	} else {
-		ch <- []*config.TargetGroup{tg}
+		ch <- []*targetgroup.Group{tg}
 	}
 
 	for {
@@ -129,7 +169,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 			if err != nil {
 				level.Error(d.logger).Log("msg", "Refreshing targets failed", "err", err)
 			} else {
-				ch <- []*config.TargetGroup{tg}
+				ch <- []*targetgroup.Group{tg}
 			}
 		case <-ctx.Done():
 			return
@@ -137,7 +177,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 	}
 }
 
-func (d *Discovery) refresh() (tg *config.TargetGroup, err error) {
+func (d *Discovery) refresh() (tg *targetgroup.Group, err error) {
 	t0 := time.Now()
 	defer func() {
 		refreshDuration.Observe(time.Since(t0).Seconds())
@@ -147,7 +187,7 @@ func (d *Discovery) refresh() (tg *config.TargetGroup, err error) {
 	}()
 
 	var endpoint = fmt.Sprintf("https://%s:%d/v%d/discover", d.sdConfig.Endpoint, d.sdConfig.Port, d.sdConfig.Version)
-	tg = &config.TargetGroup{
+	tg = &targetgroup.Group{
 		Source: endpoint,
 	}
 
