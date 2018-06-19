@@ -32,6 +32,7 @@ import (
 	"github.com/prometheus/prometheus/discovery/file"
 	"github.com/prometheus/prometheus/discovery/gce"
 	"github.com/prometheus/prometheus/discovery/kubernetes"
+	"github.com/prometheus/prometheus/discovery/eureka"
 	"github.com/prometheus/prometheus/discovery/marathon"
 	"github.com/prometheus/prometheus/discovery/openstack"
 	"github.com/prometheus/prometheus/discovery/triton"
@@ -230,6 +231,14 @@ func (m *Manager) providersFromConfig(cfg sd_config.ServiceDiscoveryConfig) map[
 			continue
 		}
 		app("consul", i, k)
+	}
+	for i, c := range cfg.EurekaSDConfigs {
+		t, err := eureka.NewDiscovery(*c, log.With(m.logger, "discovery", "eureka"))
+		if err != nil {
+			level.Error(m.logger).Log("msg", "Cannot create Eureka discovery", "err", err)
+			continue
+		}
+		app("eureka", i, t)
 	}
 	for i, c := range cfg.MarathonSDConfigs {
 		t, err := marathon.NewDiscovery(*c, log.With(m.logger, "discovery", "marathon"))

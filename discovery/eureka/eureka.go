@@ -124,7 +124,7 @@ type Discovery struct {
 }
 
 // NewDiscovery returns a new Eureka Service Discovery.
-func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
+func NewDiscovery(conf SDConfig, logger log.Logger) (*Discovery, error) {
 	client := eureka.NewClient(conf.Servers, logger)
 
 	return &Discovery{

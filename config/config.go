@@ -178,6 +178,11 @@ func resolveFilepaths(baseDir string, cfg *Config) {
 			mcfg.HTTPClientConfig.TLSConfig.CertFile = join(mcfg.HTTPClientConfig.TLSConfig.CertFile)
 			mcfg.HTTPClientConfig.TLSConfig.KeyFile = join(mcfg.HTTPClientConfig.TLSConfig.KeyFile)
 		}
+		for _, eurekacfg := range cfg.EurekaSDConfigs {
+			eurekacfg.TLSConfig.CAFile = join(eurekacfg.TLSConfig.CAFile)
+			eurekacfg.TLSConfig.CertFile = join(eurekacfg.TLSConfig.CertFile)
+			eurekacfg.TLSConfig.KeyFile = join(eurekacfg.TLSConfig.KeyFile)
+		}
 		for _, consulcfg := range cfg.ConsulSDConfigs {
 			consulcfg.TLSConfig.CAFile = join(consulcfg.TLSConfig.CAFile)
 			consulcfg.TLSConfig.CertFile = join(consulcfg.TLSConfig.CertFile)
